@@ -1,14 +1,26 @@
-"""LLM client for Anthropic models."""
+"""LLM client for various models including Anthropic, OpenAI, and Google Gemini."""
 
 import json
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Tuple, cast
+from typing import Any, Dict, List, Tuple, Union, cast
 from dataclasses_json import DataClassJsonMixin
 import anthropic
 import openai
+
+# For Google Gemini support
+# Note: You need to install the Google Generative AI library:
+# pip install google-generativeai
+try:
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("Google Generative AI library not available. Install with: pip install google-generativeai")
 from anthropic import (
     NOT_GIVEN as Anthropic_NOT_GIVEN,
 )
@@ -612,11 +624,215 @@ class OpenAIDirectClient(LLMClient):
         return augment_messages, message_metadata
 
 
+class GeminiDirectClient(LLMClient):
+    """Use Google Gemini models via first party API."""
+
+    def __init__(
+        self,
+        model_name: str = "gemini-1.5-pro",
+        max_retries: int = 2,
+        api_key: str = None,
+    ):
+        """Initialize the Google Gemini first party client.
+
+        Args:
+            model_name: The model name to use. Default is "gemini-1.5-pro".
+            max_retries: The maximum number of retries for API calls.
+            api_key: The API key to use. If None, uses GOOGLE_API_KEY environment variable.
+        """
+        if not GEMINI_AVAILABLE:
+            raise ImportError(
+                "Google Generative AI library not available. Install with: pip install google-generativeai"
+            )
+
+        # Use provided api_key or default to environment variable
+        api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("Google API key is required. Set GOOGLE_API_KEY environment variable or pass api_key parameter.")
+
+        # Configure the Gemini API
+        genai.configure(api_key=api_key)
+
+        # Store configuration
+        self.model_name = model_name
+        self.max_retries = max_retries
+        self.generation_config = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "max_output_tokens": 8192,
+        }
+        self.safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        # Initialize the model
+        self.model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self.generation_config,
+            safety_settings=self.safety_settings,
+        )
+
+    def generate(
+        self,
+        messages: LLMMessages,
+        max_tokens: int,
+        system_prompt: str | None = None,
+        temperature: float = 0.0,
+        tools: list[ToolParam] = [],
+        tool_choice: dict[str, str] | None = None,
+        thinking_tokens: int | None = None,
+    ) -> Tuple[list[AssistantContentBlock], dict[str, Any]]:
+        """Generate responses using Google Gemini.
+
+        Args:
+            messages: A list of messages.
+            max_tokens: The maximum number of tokens to generate.
+            system_prompt: A system prompt.
+            temperature: The temperature.
+            tools: A list of tools.
+            tool_choice: A tool choice.
+            thinking_tokens: Not supported for Gemini.
+
+        Returns:
+            A tuple of (generated response, metadata).
+        """
+        assert thinking_tokens is None, "Thinking tokens not implemented for Gemini"
+
+        # Update generation config with the provided parameters
+        generation_config = self.generation_config.copy()
+        generation_config["temperature"] = temperature
+        generation_config["max_output_tokens"] = max_tokens
+
+        # Convert messages to Gemini format
+        gemini_messages = []
+
+        # Add system prompt if provided
+        if system_prompt:
+            gemini_messages.append({"role": "user", "parts": [system_prompt]})
+            gemini_messages.append({"role": "model", "parts": ["I'll help you with that."]})
+
+        # Convert messages
+        for idx, message_list in enumerate(messages):
+            if len(message_list) > 1:
+                raise ValueError("Only one entry per message supported for Gemini")
+
+            augment_message = message_list[0]
+            role = "user" if idx % 2 == 0 else "model"
+
+            if str(type(augment_message)) == str(TextPrompt):
+                augment_message = cast(TextPrompt, augment_message)
+                gemini_messages.append({"role": role, "parts": [augment_message.text]})
+            elif str(type(augment_message)) == str(TextResult):
+                augment_message = cast(TextResult, augment_message)
+                gemini_messages.append({"role": role, "parts": [augment_message.text]})
+            elif str(type(augment_message)) == str(ToolCall):
+                # For tool calls, we need to format them as text for Gemini
+                augment_message = cast(ToolCall, augment_message)
+                tool_call_text = f"Function call: {augment_message.tool_name}({json.dumps(augment_message.tool_input)})"
+                gemini_messages.append({"role": role, "parts": [tool_call_text]})
+            elif str(type(augment_message)) == str(ToolFormattedResult):
+                # For tool results, we format them as text
+                augment_message = cast(ToolFormattedResult, augment_message)
+                tool_result_text = f"Function result: {augment_message.tool_output}"
+                gemini_messages.append({"role": role, "parts": [tool_result_text]})
+            else:
+                print(
+                    f"Unknown message type: {type(augment_message)}, expected one of {str(TextPrompt)}, {str(TextResult)}, {str(ToolCall)}, {str(ToolFormattedResult)}"
+                )
+                raise ValueError(f"Unknown message type: {type(augment_message)}")
+
+        # Convert tools to Gemini function declarations if provided
+        function_declarations = []
+        if tools and len(tools) > 0:
+            for tool in tools:
+                function_declaration = {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }
+                function_declarations.append(function_declaration)
+
+        # Set up the chat session
+        chat = self.model.start_chat(history=gemini_messages)
+
+        # Generate response
+        response = None
+        for retry in range(self.max_retries):
+            try:
+                # If tools are provided, use function calling
+                if function_declarations and len(function_declarations) > 0:
+                    response = chat.send_message(
+                        "",
+                        generation_config=generation_config,
+                        tools=function_declarations,
+                    )
+                else:
+                    response = chat.send_message(
+                        "",
+                        generation_config=generation_config,
+                    )
+                break
+            except Exception as e:
+                if retry == self.max_retries - 1:
+                    print(f"Failed Gemini request after {retry + 1} retries")
+                    raise e
+                else:
+                    print(f"Retrying Gemini request: {retry + 1}/{self.max_retries}")
+                    # Sleep 4-6 seconds with jitter to avoid thundering herd
+                    time.sleep(5 * random.uniform(0.8, 1.2))
+
+        # Convert response to Augment format
+        augment_messages = []
+        assert response is not None
+
+        # Check if the response contains function calls
+        function_calls = getattr(response, "function_calls", None)
+        if function_calls and len(function_calls) > 0:
+            # Process function calls
+            for function_call in function_calls:
+                # Generate a unique ID for the tool call
+                tool_call_id = str(uuid.uuid4())
+
+                # Parse the function arguments
+                try:
+                    tool_input = json.loads(function_call.args)
+                except json.JSONDecodeError:
+                    tool_input = function_call.args
+
+                # Create a tool call
+                augment_messages.append(
+                    ToolCall(
+                        tool_call_id=tool_call_id,
+                        tool_name=function_call.name,
+                        tool_input=tool_input,
+                    )
+                )
+        else:
+            # Process text response
+            augment_messages.append(TextResult(text=response.text))
+
+        # Create metadata
+        message_metadata = {
+            "raw_response": response,
+            # Gemini doesn't provide token counts directly, so we estimate
+            "input_tokens": -1,  # Not available
+            "output_tokens": -1,  # Not available
+        }
+
+        return augment_messages, message_metadata
+
+
 def get_client(client_name: str, **kwargs) -> LLMClient:
     """Get a client for a given client name."""
     if client_name == "anthropic-direct":
         return AnthropicDirectClient(**kwargs)
     elif client_name == "openai-direct":
         return OpenAIDirectClient(**kwargs)
+    elif client_name == "gemini-direct":
+        return GeminiDirectClient(**kwargs)
     else:
         raise ValueError(f"Unknown client name: {client_name}")
