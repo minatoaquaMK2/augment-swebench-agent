@@ -86,11 +86,6 @@ def main():
     else:
         logger_for_agent_logs.propagate = False
 
-    # Check if ANTHROPIC_API_KEY is set
-    if "ANTHROPIC_API_KEY" not in os.environ:
-        print("Error: ANTHROPIC_API_KEY environment variable is not set.")
-        print("Please set it to your Anthropic API key.")
-        sys.exit(1)
 
     # Initialize console
     console = Console()
