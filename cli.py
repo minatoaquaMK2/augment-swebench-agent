@@ -114,9 +114,8 @@ def main():
 
     # Initialize LLM client
     client = get_client(
-        "anthropic-direct",
-        model_name="claude-3-7-sonnet-20250219",
-        use_caching=True,
+        "openai-direct",
+        model_name="Qwen/Qwen3-235B-A22B",
     )
 
     # Initialize workspace manager

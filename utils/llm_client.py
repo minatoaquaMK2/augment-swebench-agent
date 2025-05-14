@@ -397,13 +397,23 @@ class AnthropicDirectClient(LLMClient):
 class OpenAIDirectClient(LLMClient):
     """Use OpenAI models via first party API."""
 
-    def __init__(self, model_name: str, max_retries=2, cot_model: bool = True):
+    def __init__(self, model_name: str, max_retries=2, cot_model: bool = False, base_url=None, api_key=None):
         """Initialize the OpenAI first party client."""
-        api_key = os.getenv("OPENAI_API_KEY")
-        self.client = openai.OpenAI(
-            api_key=api_key,
-            max_retries=1,
-        )
+        # Use provided api_key or default to environment variable
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+
+        # Use provided base_url or default to environment variable or a default value
+        base_url = "http://100.80.20.5:4000/v1"
+
+        # Configure client with appropriate parameters
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "max_retries": 1,
+        }
+
+        # Create the client
+        self.client = openai.OpenAI(**client_kwargs)
         self.model_name = model_name
         self.max_retries = max_retries
         self.cot_model = cot_model
@@ -454,12 +464,18 @@ class OpenAIDirectClient(LLMClient):
                 openai_message = {"role": "assistant", "content": [message_content]}
             elif str(type(augment_message)) == str(ToolCall):
                 augment_message = cast(ToolCall, augment_message)
+                # Ensure tool arguments are properly serialized as a JSON string
+                if isinstance(augment_message.tool_input, dict):
+                    tool_arguments = json.dumps(augment_message.tool_input)
+                else:
+                    tool_arguments = str(augment_message.tool_input)
+
                 tool_call = {
                     "type": "function",
                     "id": augment_message.tool_call_id,
                     "function": {
                         "name": augment_message.tool_name,
-                        "arguments": augment_message.tool_input,
+                        "arguments": tool_arguments,
                     },
                 }
                 openai_message = {
@@ -555,9 +571,7 @@ class OpenAIDirectClient(LLMClient):
         content = openai_response_message.content
 
         # Exactly one of tool_calls or content should be present
-        if tool_calls and content:
-            raise ValueError("Only one of tool_calls or content should be present")
-        elif not tool_calls and not content:
+        if not tool_calls and not content:
             raise ValueError("Either tool_calls or content should be present")
 
         if tool_calls:
@@ -565,8 +579,12 @@ class OpenAIDirectClient(LLMClient):
                 raise ValueError("Only one tool call supported for OpenAI")
             tool_call = tool_calls[0]
             try:
-                # Parse the JSON string into a dictionary
-                tool_input = json.loads(tool_call.function.arguments)
+                # Check if arguments is already a dictionary or needs to be parsed from JSON string
+                if isinstance(tool_call.function.arguments, dict):
+                    tool_input = tool_call.function.arguments
+                else:
+                    # Parse the JSON string into a dictionary
+                    tool_input = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
                 print(f"Failed to parse tool arguments: {tool_call.function.arguments}")
                 print(f"JSON parse error: {str(e)}")
